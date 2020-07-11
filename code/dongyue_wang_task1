@@ -1,0 +1,170 @@
+from os import environ
+from pyspark import SparkConf, SparkContext
+import sys
+import csv
+import itertools
+import time
+import random
+
+
+if __name__ == '__main__':
+    if sys.argv[2] != 'jaccard':
+        print("Task1: Only worked on Jaccard Distance, not Cosine Similarity.")
+        exit(-1)
+
+
+conf = SparkConf().setAppName('REC')
+sc = SparkContext(conf=conf)
+
+starttime = time.time()
+
+# Read input variables
+input_path = sys.argv[1]
+case = sys.argv[2]
+output_path = sys.argv[3]
+
+
+rdd = sc.textFile(input_path)
+rawrdd = rdd.mapPartitions(lambda x: csv.reader(x))
+header = rawrdd.first()
+yelprdd = rawrdd.filter(lambda x: x != header)
+
+# print(yelprdd.take(10))
+# header: ['user_id', ' business_id', ' stars']
+
+# build an original matrix (user by business)
+user = yelprdd.map(lambda x: x[0]).distinct().collect()  ## already gives a list
+business = yelprdd.map(lambda x: x[1]).distinct().collect()
+# user_count = len(user)
+# business_count = len(business)
+## users: 11270
+## business: 24732
+
+## Encode each user and each business into number label
+user_sort = sorted(list(user))
+business_sort = sorted(list(business))
+
+user_dic = {}
+business_dic = {}
+
+for i in range(len(user_sort)):
+    user_dic[user_sort[i]] = user_dic.get(user_sort[i], 0) + i
+# print(user_dic)
+
+
+for i in range(len(business_sort)):
+    business_dic[business_sort[i]] = business_dic.get(business_sort[i], 0) + i
+# print(business_dic)
+
+
+### ???   x[0] changed into user number but not user ID
+baskets = yelprdd.map(lambda x: (business_dic[x[1]], int(user_dic[x[0]]))).distinct().map(lambda x: (x[0], [x[1]])).reduceByKey(
+    lambda a, b: a + b).sortByKey()
+# print(baskets.take(5))
+origin_matrix = baskets.collect()
+
+# Hash functions: f(x) = ((ax + b) % p) % m
+# m: number of bins
+m = len(user_sort)
+
+# Source: https://planetmath.org/goodhashtableprimes
+primes = [97, 193, 389, 769, 1543, 3079, 6151, 12289, 24593, 49157, 98317]
+
+hash_functions = []
+
+for i in range(120):
+    a = random.choice(range(m))
+    b = random.choice(range(m))
+    p = random.choice(primes)
+
+    hash_functions.append([a, b, p])
+
+
+def hashing(x, a, b, p, m):
+    result_list = []
+
+    # x[1] is the basket values
+    for input in x:
+        result_list.append(((a * input + b) % p) % m)
+    return min(result_list)
+
+signature = baskets.map(lambda x: (x[0], [hashing(x[1], a, b, p, m) for a, b, p in hash_functions]))
+signature_collect = signature.collect()
+
+
+# b bands with r rows each
+n = len(hash_functions)
+b = 40
+r = int(n/b)
+
+# define a function to generate banded list
+def banded(input_list, b, r):
+    banded_list = []
+    for band in range(b):
+        band_list = []
+        for row in range(r):
+            band_list.append(input_list[band * r + row])
+
+#         banded_list.append(band_list)
+        banded_list.append(tuple([band, tuple(band_list)]))
+#         banded_list.append([band, band_list])
+    return banded_list
+
+
+# for each signature, generate list of business with same signatures in same band
+signature_banded = signature.map(lambda x: (x[0], banded(x[1], b, r))).\
+    flatMap(lambda x: ((x[1][i], x[0]) for i in range(b))).map(lambda x: (x[0], [x[1]])).reduceByKey(lambda a, b: a+b).\
+    filter(lambda x: len(x[1])>1).map(lambda x: x[1])
+
+# print(signature_banded.take(10))
+
+
+# define a function to generate pairs from the previous RDD
+def pair_generator(basket):
+    candidate_pair = []
+
+    if len(basket) == 2:
+        if set(basket) not in candidate_pair:
+            candidate_pair.append(tuple(sorted(basket)))
+
+    else:
+        pairs = itertools.combinations(basket, 2)
+        for pair in pairs:
+            if set(pair) not in candidate_pair:
+                candidate_pair.append(tuple(sorted(pair)))
+
+    return sorted(candidate_pair)
+
+
+# Generate candidate pairs
+candidate_pairs = signature_banded.flatMap(lambda x: pair_generator(x)).distinct()
+# print(candidate_pairs.collect())
+
+
+# define a function to calculate jaccard distance
+def jaccard(x, y):
+    # x: x[0] is the integer indicating business
+    # y: x[1]
+    distance = len(set(origin_matrix[x][1]) & set(origin_matrix[y][1])) / len(set(origin_matrix[x][1]) | set(origin_matrix[y][1]))
+    return distance
+
+# Generate all business pairs whose similarity is larger than 0.5
+
+## Check calculation method
+# if case == 'jaccard':
+
+similarity_rdd = candidate_pairs.map(lambda x: (x, jaccard(x[0], x[1]))).filter(lambda x: x[1]>=0.5).sortBy(lambda x: (x[0][0], x[0][1]))
+# print(similarity_rdd.take(30))
+
+# Output file: model_output.txt
+
+with open(output_path, 'w') as outfile:
+    outfile.write('business_id_1, business_id_2, similarity\n')
+    for x in similarity_rdd.collect():
+        res = business_sort[x[0][0]] + "," + business_sort[x[0][1]] + "," + str(x[1])
+
+        outfile.write(res + '\n')
+
+duration = time.time() - starttime
+print("Duration:", duration)
+
